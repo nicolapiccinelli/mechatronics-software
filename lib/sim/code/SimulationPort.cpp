@@ -31,26 +31,47 @@ void printBacktrace()
     free(symbols);
 }
 
+namespace {
+
+constexpr double kDacBitsPerAmp = 5242.88;
+constexpr uint32_t kAmpStatusBit = 0x20000000u;
+constexpr uint32_t kEncMidrange = 0x00800000u;
+
+uint8_t PackAxisTemperature(double temperatureC)
+{
+    const long raw = std::lround(temperatureC * 2.0);
+    return static_cast<uint8_t>(std::max(0L, std::min(255L, raw)));
+}
+
+}
+
 SimulationPort::SimulationPort(int portNum, std::ostream &ostr) : BasePort(portNum, ostr)
 {
-    // std::cout << "[Simulation Port] Constructor called" << std::endl;
+    backend = sim::MakeSocketBackendFromEnvironment();
+    if (backend)
+    {
+        ostr << "[Simulation Port] Using backend '" << backend->Name() << "'" << std::endl;
+    }
+    else
+    {
+        ostr << "[Simulation Port] Using default backend" << std::endl;
+        backend = sim::MakeDefaultBackend();
+    }
 
-    // Prepare PROM sector content ending with
-    // 0xFF terminator as in real PROM
+    // Prepare PROM sector content ending with 0xFF terminator as in real PROM
     SimPromCurrentAddr = 0;
+
+    // Initialize the simulation system
     Init();
 }
 
 SimulationPort::~SimulationPort()
 {
-    // std::cout << "[Simulation Port] Destructor called" << std::endl;
     Cleanup();
 }
 
 bool SimulationPort::Init()
 {
-    // std::cout << "[Simulation Port] Init called" << std::endl;
-
     // Invoke scan nodes to initialize simulated nodes
     bool ret = ScanNodes();
 
@@ -68,33 +89,18 @@ bool SimulationPort::Init()
         }
     }
 
-    // Start dynamics background thread
-    dynamicsRun = true;
-    dynamicsThread = std::thread(&SimulationPort::DynamicsThreadFunc, this);
+    StartDynamicsThread();
 
     return ret;
 }
 
 void SimulationPort::Cleanup()
 {
-    // std::cout << "[Simulation Port] Cleanup called" << std::endl;
-
-    // Nothing to clean up for simulation
-    if (dynamicsRun.load())
-    {
-        dynamicsRun = false;
-
-        if (dynamicsThread.joinable())
-        {
-            dynamicsThread.join();
-        }
-    }
+    StopDynamicsThread();
 }
 
 nodeid_t SimulationPort::InitNodes()
 {
-    // std::cout << "[Simulation Port] InitNodes called" << std::endl;
-
     // let's simulate the maximum number of boards since we don't
     // know exactly how many boards will be added later
     return BoardIO::MAX_BOARDS;
@@ -102,27 +108,71 @@ nodeid_t SimulationPort::InitNodes()
 
 int SimulationPort::NumberOfUsers()
 {
-    // std::cout << "[Simulation Port] NumberOfUsers called" << std::endl;
     return 1;
 }
 
 unsigned int SimulationPort::GetBusGeneration() const
 {
-    // std::cout << "[Simulation Port] GetBusGeneration called" << std::endl;
     return 0;
 }
 
 bool SimulationPort::AddBoard(BoardIO *board)
 {
-    // std::cout << "[Simulation Port] AddBoard called" << std::endl;
     bool ret = BasePort::AddBoard(board);
     return ret;
 }
 
 bool SimulationPort::RemoveBoard(unsigned char boardId)
 {
-    // std::cout << "[Simulation Port] RemoveBoard called" << std::endl;
     return BasePort::RemoveBoard(boardId);
+}
+
+void SimulationPort::StartDynamicsThread()
+{
+    if (dynamicsRun.load())
+    {
+        return;
+    }
+
+    if (!backend)
+    {
+        backend = sim::MakeDefaultBackend();
+    }
+
+    if (!backendActive)
+    {
+        backend->Initialize(*this);
+        backendActive = true;
+    }
+
+    dynamicsRun = true;
+    dynamicsThread = std::thread(&SimulationPort::DynamicsThreadFunc, this);
+}
+
+void SimulationPort::StopDynamicsThread()
+{
+    if (!dynamicsRun.load())
+    {
+        if (backendActive && backend)
+        {
+            backend->Shutdown(*this);
+            backendActive = false;
+        }
+        return;
+    }
+
+    dynamicsRun = false;
+
+    if (dynamicsThread.joinable())
+    {
+        dynamicsThread.join();
+    }
+
+    if (backendActive && backend)
+    {
+        backend->Shutdown(*this);
+        backendActive = false;
+    }
 }
 
 bool SimulationPort::WriteBroadcastOutput(quadlet_t *buffer, unsigned int size)
@@ -144,9 +194,6 @@ void SimulationPort::WaitBroadcastRead()
 
 bool SimulationPort::ReadBlockNode(nodeid_t node, nodeaddr_t addr, quadlet_t *rdata, unsigned int nbytes, unsigned char)
 {
-    // std::cout << "[Simulation Port] ReadBlockNode called for node " << node << ", addr "
-    //           << std::hex << addr << std::dec << ", nbytes " << nbytes << std::endl;
-
     // Simulate real-time block read (addr 0x0000)
     if (addr == 0x0000)
     {
@@ -181,7 +228,37 @@ bool SimulationPort::ReadBlockNode(nodeid_t node, nodeaddr_t addr, quadlet_t *rd
 
         if (numQuads > 2)
         {
-            rdata[2] = bswap_32(state.DigitalIO);
+            uint32_t digitalIO = 0;
+            const uint8_t dout = static_cast<uint8_t>(state.DigitalOutput & DOUT_MASK);
+
+            // Digital outputs are stored inverted in the readback register so that
+            // AmpIO::GetDigitalOutput returns the actual hardware state after inversion.
+            digitalIO |= (static_cast<uint32_t>((~dout) & DOUT_MASK) << DOUT_FB_SHIFT);
+
+            // Match the QLA test board loopback used by qlatest:
+            // DOUT4 drives all home/positive/negative limit inputs together.
+            if (dout & 0x08u)
+            {
+                digitalIO |= (DOUT_MASK << HOME_SHIFT);
+                digitalIO |= (DOUT_MASK << POS_LIMIT_SHIFT);
+                digitalIO |= (DOUT_MASK << NEG_LIMIT_SHIFT);
+            }
+
+            // DOUT1/2/3 drive encoder A/B/I inputs for all 4 channels.
+            if (dout & 0x01u)
+            {
+                digitalIO |= (DOUT_MASK << ENC_A_SHIFT);
+            }
+            if (dout & 0x02u)
+            {
+                digitalIO |= (DOUT_MASK << ENC_B_SHIFT);
+            }
+            if (dout & 0x04u)
+            {
+                digitalIO |= (DOUT_MASK << ENC_INDEX_SHIFT);
+            }
+
+            rdata[2] = bswap_32(digitalIO);
         }
 
         if (numQuads > 3)
@@ -199,7 +276,7 @@ bool SimulationPort::ReadBlockNode(nodeid_t node, nodeaddr_t addr, quadlet_t *rd
                 const uint32_t ENC_MIDRANGE = 0x00800000u;
 
                 // Use physical position from SimPosition to avoid issues with EncoderOffset wrapping
-                double counts_from_zero = (state.Axes[i].SimPosition / (2.0 * M_PI)) * state.Axes[i].params.counts_per_turn;
+                double counts_from_zero = (state.Axes[i].SimPosition / (2.0 * M_PI)) * state.Axes[i].config.counts_per_turn;
                 int32_t physicalPos = static_cast<int32_t>(counts_from_zero + 0x800000);
 
                 int32_t signedCounts = static_cast<int32_t>(physicalPos & 0x00FFFFFFu) - static_cast<int32_t>(ENC_MIDRANGE);
@@ -398,8 +475,6 @@ bool SimulationPort::ReadBlockNode(nodeid_t node, nodeaddr_t addr, quadlet_t *rd
 
 bool SimulationPort::WriteBlockNode(nodeid_t node, nodeaddr_t addr, quadlet_t *wdata, unsigned int nbytes, unsigned char)
 {
-    // std::cout << "[Simulation Port] WriteBlockNode called for node " << node << ", addr " << std::hex << addr << std::dec << ", nbytes " << nbytes << std::endl;
-
     if (addr == 0x0000)
     {
         // Constants from AmpIO.cpp
@@ -534,8 +609,6 @@ bool SimulationPort::WriteBlockNode(nodeid_t node, nodeaddr_t addr, quadlet_t *w
 
 bool SimulationPort::ReadQuadletNode(nodeid_t node, nodeaddr_t addr, quadlet_t &data, unsigned char flags)
 {
-    // std::cout << "[Simulation Port] ReadQuadletNode called for node " << node << ", addr " << std::hex << addr << std::dec << std::endl;
-
     // Check for per-axis registers (channels 1-4)
     unsigned int channel = (addr >> 4);
     unsigned int reg = (addr & 0x0F);
@@ -607,8 +680,6 @@ bool SimulationPort::ReadQuadletNode(nodeid_t node, nodeaddr_t addr, quadlet_t &
 
 bool SimulationPort::WriteQuadletNode(nodeid_t node, nodeaddr_t addr, quadlet_t data, unsigned char flags)
 {
-    // std::cout << "[Simulation Port] WriteQuadletNode called for node " << node << ", addr " << std::hex << addr << std::dec << std::endl;
-
     // Check for per-axis registers (channels 1-4)
     unsigned int channel = (addr >> 4);
     unsigned int reg = (addr & 0x0F);
@@ -786,6 +857,17 @@ bool SimulationPort::WriteQuadletNode(nodeid_t node, nodeaddr_t addr, quadlet_t 
         std::cout << "[Simulation Port] WriteWatchdogPeriod: " << std::hex << data << std::dec << std::endl;
         return true;
     }
+    case 0x0006:
+    {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        BoardState &state = mBoardStates[node];
+        const uint8_t mask = static_cast<uint8_t>((data >> 8) & DOUT_MASK);
+        const uint8_t encodedBits = static_cast<uint8_t>(data & DOUT_MASK);
+        const uint8_t requestedBits = static_cast<uint8_t>((~encodedBits) & mask);
+
+        state.DigitalOutput = static_cast<uint8_t>((state.DigitalOutput & ~mask) | requestedBits);
+        return true;
+    }
     case 0x0008:
     {
         // Handle PROM read command for M25P16 (data top byte contains command)
@@ -824,8 +906,6 @@ quadlet_t SimulationPort::ProcessPROM(nodeid_t node)
 {
     quadlet_t data = 0;
 
-    // std::cout << "[Simulation Port] ProcessPROM called" << std::endl;
-
     // process the oldest write request for this node
     // let's check if there is any write request for this node
     auto &req_queue = WriteRequestQueues[node];
@@ -860,7 +940,6 @@ quadlet_t SimulationPort::ProcessPROM(nodeid_t node)
     return data;
 }
 
-// Return a simulated PROM byte at absolute 24-bit address. Unused locations are 0xFF.
 uint8_t SimulationPort::GetSimPromByte(uint32_t abs_addr) const
 {
     // Handle 25AA128 PROM (QLA serial number) - low addresses
@@ -890,126 +969,72 @@ uint8_t SimulationPort::GetSimPromByte(uint32_t abs_addr) const
     return 0xFF;
 }
 
-void SimulationPort::UpdateAxisDynamics(nodeid_t node, BoardState &state, double dt)
+void SimulationPort::PrepareBackendState(BoardState &state)
 {
     for (int i = 0; i < 4; ++i)
     {
-        // reference to axis state
-        auto &ax = state.Axes[i];
-
-        // Convert DAC bits to Amps using XML-compatible scaling
-        // XML AmpsToBits: Offset=32768, Scale=5242.88 -> bits = 32768 + amps * 5242.88
-        // Invert: amps = (bits - 32768) / 5242.88
-        const double DAC_BITS_PER_AMP = 5242.88;
-        double current = (static_cast<int>(ax.MotorCurrent) - 32768) / DAC_BITS_PER_AMP;
-
-        // check if the motor is enabled
-        const uint32_t MSTAT_AMP_STATUS = 0x20000000;
-        if ((ax.MotorStatus & MSTAT_AMP_STATUS) == 0)
+        AxisState &axis = state.Axes[i];
+        const double current = (static_cast<int>(axis.MotorCurrent) - 32768) / kDacBitsPerAmp;
+        axis.CommandTorque = current * axis.config.torque_constant;
+        if ((axis.MotorStatus & kAmpStatusBit) == 0)
         {
-            current = 0.0;
+            axis.CommandTorque = 0.0;
         }
+    }
+}
 
-        // Physics simulation in SI units (radians, radians/sec, Nm)
-        // Use RK4 integration with sub-stepping for robustness
-        const unsigned int steps = std::max(1u, ax.params.integration_steps);
-        const double h = dt / static_cast<double>(steps);
+void SimulationPort::UpdateEmulatedFeedback(BoardState &state, double dt)
+{
+    state.Temperature = 0;
 
-        auto accel = [&](double pos, double vel)
-        {
-            double torque = current * ax.params.torque_constant;
-            return (torque - ax.params.viscous_damping * vel) / ax.params.motor_inertia;
-        };
+    for (int i = 0; i < 4; ++i)
+    {
+        AxisState &axis = state.Axes[i];
+        const double current = (axis.config.torque_constant != 0.0)
+                       ? (axis.CommandTorque / axis.config.torque_constant)
+                                   : 0.0;
+        const double dTdt = axis.config.thermal_heating_coeff * (current * current) -
+                    axis.config.thermal_cooling_coeff * (axis.TemperatureC - axis.config.ambient_temp_c);
+        axis.TemperatureC += dTdt * dt;
 
-        for (unsigned int s = 0; s < steps; ++s)
-        {
-            // RK4 on the state [position, velocity]
-            double k1_pos = ax.SimVelocity;
-            double k1_vel = accel(ax.SimPosition, ax.SimVelocity);
-
-            double k2_pos = ax.SimVelocity + 0.5 * h * k1_vel;
-            double k2_vel = accel(ax.SimPosition + 0.5 * h * k1_pos,
-                                  ax.SimVelocity + 0.5 * h * k1_vel);
-
-            double k3_pos = ax.SimVelocity + 0.5 * h * k2_vel;
-            double k3_vel = accel(ax.SimPosition + 0.5 * h * k2_pos,
-                                  ax.SimVelocity + 0.5 * h * k2_vel);
-
-            double k4_pos = ax.SimVelocity + h * k3_vel;
-            double k4_vel = accel(ax.SimPosition + h * k3_pos,
-                                  ax.SimVelocity + h * k3_vel);
-
-            ax.SimPosition += (h / 6.0) * (k1_pos + 2.0 * k2_pos + 2.0 * k3_pos + k4_pos);
-            ax.SimVelocity += (h / 6.0) * (k1_vel + 2.0 * k2_vel + 2.0 * k3_vel + k4_vel);
-        }
-
-        // Simple temperature model per axis: heating ~ I^2, cooling to ambient
-        // this is not used in the dynamics but just for reporting temperature
-        // so we don't really need to RK4 this
-        double dTdt_axis = ax.params.thermal_heating_coeff * (current * current) -
-                           ax.params.thermal_cooling_coeff * (ax.TemperatureC - ax.params.ambient_temp_c);
-
-        ax.TemperatureC += dTdt_axis * dt;
-
-        // Pack temperature into the state register
-        // AmpIO expects 2x Celsius in 8 bits.
-        // Packing: T2(MSB), T3, T0, T1(LSB)
-        // i=0 -> T0 (bits 8-15)
-        // i=1 -> T1 (bits 0-7)
-        // i=2 -> T2 (bits 24-31)
-        // i=3 -> T3 (bits 16-23)
-        uint8_t val = static_cast<uint8_t>(std::round(ax.TemperatureC * 2.0));
+        const uint8_t packedTemp = PackAxisTemperature(axis.TemperatureC);
 
         if (i == 0)
         {
-            state.Temperature |= (static_cast<uint32_t>(val) << 8);
+            state.Temperature |= (static_cast<uint32_t>(packedTemp) << 8);
         }
         else if (i == 1)
         {
-            state.Temperature |= static_cast<uint32_t>(val);
+            state.Temperature |= static_cast<uint32_t>(packedTemp);
         }
         else if (i == 2)
         {
-            state.Temperature |= (static_cast<uint32_t>(val) << 24);
-        }
-        else if (i == 3)
-        {
-            state.Temperature |= (static_cast<uint32_t>(val) << 16);
-        }
-
-        // Convert to encoder units for register emulation
-        // Position: counts = (rad / 2pi) * counts_per_turn
-        // We add the midrange bias (0x800000) to match the initial state
-        double counts_from_zero = (ax.SimPosition / (2.0 * M_PI)) * ax.params.counts_per_turn;
-
-        // Velocity: counts/sec
-        double vel_counts = (ax.SimVelocity / (2.0 * M_PI)) * ax.params.counts_per_turn;
-        ax.EncoderVel = static_cast<int32_t>(vel_counts);
-
-        // Position with bias and offset
-        // PhysicalPos = counts_from_zero + 0x800000
-        // EncoderPos = PhysicalPos + EncoderOffset
-        double physical_pos_counts = counts_from_zero + 0x800000;
-        double encoder_pos_counts = physical_pos_counts + ax.EncoderOffset;
-
-        // Mask to 24-bit encoder position (wrap-around like hardware)
-        uint32_t pos24 = static_cast<uint32_t>(static_cast<int64_t>(encoder_pos_counts)) & 0x00FFFFFFu;
-
-        int32_t oldPos = ax.EncoderPos;
-        ax.EncoderPos = static_cast<int32_t>(pos24);
-
-        // Very simple quarter tracking: toggle quarters by position changes
-        ax.EncoderQtr1 = (ax.EncoderPos & 0x1) ? 1 : 0;
-        ax.EncoderQtr5 = (ax.EncoderPos & 0x1) ? 0 : 1;
-
-        // Running counter: time since last edge (increment by dt in microseconds)
-        if (ax.EncoderPos != oldPos)
-        {
-            ax.EncoderRun = 0;
+            state.Temperature |= (static_cast<uint32_t>(packedTemp) << 24);
         }
         else
         {
-            ax.EncoderRun += static_cast<int32_t>(dt * 1e6);
+            state.Temperature |= (static_cast<uint32_t>(packedTemp) << 16);
+        }
+
+        const double countsFromZero = (axis.SimPosition / (2.0 * M_PI)) * axis.config.counts_per_turn;
+        const double velocityCounts = (axis.SimVelocity / (2.0 * M_PI)) * axis.config.counts_per_turn;
+        axis.EncoderVel = static_cast<int32_t>(velocityCounts);
+
+        const double encoderPosCounts = countsFromZero + kEncMidrange + axis.EncoderOffset;
+        const uint32_t pos24 = static_cast<uint32_t>(static_cast<int64_t>(encoderPosCounts)) & 0x00FFFFFFu;
+
+        const int32_t oldPos = axis.EncoderPos;
+        axis.EncoderPos = static_cast<int32_t>(pos24);
+        axis.EncoderQtr1 = (axis.EncoderPos & 0x1) ? 1 : 0;
+        axis.EncoderQtr5 = axis.EncoderQtr1 ? 0 : 1;
+
+        if (axis.EncoderPos != oldPos)
+        {
+            axis.EncoderRun = 0;
+        }
+        else
+        {
+            axis.EncoderRun += static_cast<int32_t>(dt * 1e6);
         }
     }
 }
@@ -1021,17 +1046,43 @@ void SimulationPort::DynamicsThreadFunc()
     {
         auto start = std::chrono::steady_clock::now();
         {
-            // Update all board states
             std::lock_guard<std::mutex> lock(stateMutex);
-            for (auto &kv : mBoardStates)
+            try
             {
-                UpdateAxisDynamics(kv.first, kv.second, joint_params.dynamics_dt_sec);
+                for (auto &entry : mBoardStates)
+                {
+                    PrepareBackendState(entry.second);
+                }
+
+                if (backend)
+                {
+                    backend->Step(*this, mBoardStates, dynamics_dt_sec);
+                }
+
+                for (auto &entry : mBoardStates)
+                {
+                    UpdateEmulatedFeedback(entry.second, dynamics_dt_sec);
+                }
+            }
+            catch (const std::exception &ex)
+            {
+                std::cerr << "[Simulation Port] Backend '"
+                          << (backend ? backend->Name() : "<null>")
+                          << "' failed in dynamics loop: " << ex.what() << std::endl;
+                dynamicsRun = false;
+            }
+            catch (...)
+            {
+                std::cerr << "[Simulation Port] Backend '"
+                          << (backend ? backend->Name() : "<null>")
+                          << "' failed in dynamics loop with unknown exception" << std::endl;
+                dynamicsRun = false;
             }
         }
         auto end = std::chrono::steady_clock::now();
 
         auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-        auto target_us = static_cast<long>(joint_params.dynamics_dt_sec * 1e6);
+        auto target_us = static_cast<long>(dynamics_dt_sec * 1e6);
         long sleep_us = std::max(0L, target_us - elapsed);
 
         // Sleep to maintain period (simple approach)

@@ -1,7 +1,9 @@
 project(Amp1394SimulationLib)
 
 set(SOURCE_FILES
-    code/SimulationPort.cpp)
+    code/SimulationPort.cpp
+    code/SimulationPortDefaultBackend.cpp
+    code/SimulationPortSocketBackend.cpp)
 
 include_directories(
     "."
