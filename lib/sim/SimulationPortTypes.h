@@ -41,6 +41,7 @@ struct AxisState
     // ENC_MIDRANGE
     int32_t EncoderPreload = 0x800000;
     int32_t EncoderOffset = 0;
+    bool EncoderPreloadInitialized = false;
 
     // zero current
     uint32_t MotorCurrent = 32768;

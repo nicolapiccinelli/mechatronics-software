@@ -86,6 +86,12 @@ private:
     const uint32_t ENC_B_SHIFT = 20;
     const uint32_t ENC_A_SHIFT = 24;
 
+    const double DAC_BITS_PER_AMP = 5242.88;
+    const uint32_t AMP_STATUS_BIT = 0x20000000u;
+    const uint32_t ENC_MIDRANGE = 0x00800000u;
+    const int32_t ENC_MASK_24 = 0x00FFFFFF;
+    const int32_t ENC_MODULUS_24 = 0x01000000;
+
     const char kSimQLASN[12] = "QLA 1234-56";
     const std::string SimFPGASerialString = "FPGA 1234-56";
 
@@ -103,11 +109,17 @@ private:
     bool backendActive = false;
     std::unique_ptr<Backend> backend;
 
+    // 1 ms default timestep for dynamics simulation
+    // this should be enough for simulating the dynamics of the arm
     double dynamics_dt_sec = 0.001;
 
     // Helper to fetch a simulated PROM byte at absolute 24-bit address
     uint8_t GetSimPromByte(uint32_t abs_addr) const;
     quadlet_t ProcessPROM(nodeid_t node);
+    
+    int32_t WrapEncoder24(int32_t value);
+    int32_t ShortestEncoderDelta24(int32_t from, int32_t to);
+    uint8_t PackAxisTemperature(double temperatureC);
 
     // Prepare the BoardState for the backend by applying any necessary transformations
     void PrepareBackendState(BoardState &state);

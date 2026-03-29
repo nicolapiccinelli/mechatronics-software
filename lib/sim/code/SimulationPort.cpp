@@ -31,18 +31,25 @@ void printBacktrace()
     free(symbols);
 }
 
-namespace {
+int32_t SimulationPort::WrapEncoder24(int32_t value)
+{
+    return value & ENC_MASK_24;
+}
 
-constexpr double kDacBitsPerAmp = 5242.88;
-constexpr uint32_t kAmpStatusBit = 0x20000000u;
-constexpr uint32_t kEncMidrange = 0x00800000u;
+int32_t SimulationPort::ShortestEncoderDelta24(int32_t from, int32_t to)
+{
+    int32_t delta = WrapEncoder24(to - from);
+    if (delta >= static_cast<int32_t>(ENC_MIDRANGE))
+    {
+        delta -= ENC_MODULUS_24;
+    }
+    return delta;
+}
 
-uint8_t PackAxisTemperature(double temperatureC)
+uint8_t SimulationPort::PackAxisTemperature(double temperatureC)
 {
     const long raw = std::lround(temperatureC * 2.0);
     return static_cast<uint8_t>(std::max(0L, std::min(255L, raw)));
-}
-
 }
 
 SimulationPort::SimulationPort(int portNum, std::ostream &ostr) : BasePort(portNum, ostr)
@@ -702,18 +709,19 @@ bool SimulationPort::WriteQuadletNode(nodeid_t node, nodeaddr_t addr, quadlet_t 
                       << ", axis " << axisIndex << " set to " << val << std::endl;
 
             // Preserve physical position (simulated potentiometer value)
-            // PhysicalPos = (EncoderPos - EncoderOffset)
-            // NewOffset = NewEncoderPos - PhysicalPos
-            //           = val - (EncoderPos - EncoderOffset)
-            //           = val - EncoderPos + EncoderOffset
-            int32_t currentPos = mBoardStates[node].Axes[axisIndex].EncoderPos;
+            // EncoderPos is reported modulo 24 bits, so preserve physical position
+            // using the shortest signed delta on the 24-bit ring.
+            int32_t currentPos = WrapEncoder24(mBoardStates[node].Axes[axisIndex].EncoderPos);
             int32_t currentOffset = mBoardStates[node].Axes[axisIndex].EncoderOffset;
-            mBoardStates[node].Axes[axisIndex].EncoderOffset = val - currentPos + currentOffset;
+            int32_t preloadDelta = ShortestEncoderDelta24(currentPos, val);
+            mBoardStates[node].Axes[axisIndex].EncoderOffset = currentOffset + preloadDelta;
 
             mBoardStates[node].Axes[axisIndex].EncoderPreload = val;
+            mBoardStates[node].Axes[axisIndex].EncoderPreloadInitialized = true;
             mBoardStates[node].Axes[axisIndex].EncoderPos = val;
 
             std::cout << "  Updated EncoderOffset to " << mBoardStates[node].Axes[axisIndex].EncoderOffset;
+            std::cout << "  Preload delta is " << preloadDelta;
             std::cout << "  Current Pos is " << currentPos << std::endl;
             std::cout << "  Current Offset is " << currentOffset << std::endl;
 
@@ -974,9 +982,9 @@ void SimulationPort::PrepareBackendState(BoardState &state)
     for (int i = 0; i < 4; ++i)
     {
         AxisState &axis = state.Axes[i];
-        const double current = (static_cast<int>(axis.MotorCurrent) - 32768) / kDacBitsPerAmp;
+        const double current = (static_cast<int>(axis.MotorCurrent) - 32768) / DAC_BITS_PER_AMP;
         axis.CommandTorque = current * axis.config.torque_constant;
-        if ((axis.MotorStatus & kAmpStatusBit) == 0)
+        if ((axis.MotorStatus & AMP_STATUS_BIT) == 0)
         {
             axis.CommandTorque = 0.0;
         }
@@ -1020,11 +1028,22 @@ void SimulationPort::UpdateEmulatedFeedback(BoardState &state, double dt)
         const double velocityCounts = (axis.SimVelocity / (2.0 * M_PI)) * axis.config.counts_per_turn;
         axis.EncoderVel = static_cast<int32_t>(velocityCounts);
 
-        const double encoderPosCounts = countsFromZero + kEncMidrange + axis.EncoderOffset;
+        const double encoderPosCounts = countsFromZero + ENC_MIDRANGE + axis.EncoderOffset;
         const uint32_t pos24 = static_cast<uint32_t>(static_cast<int64_t>(encoderPosCounts)) & 0x00FFFFFFu;
 
         const int32_t oldPos = axis.EncoderPos;
         axis.EncoderPos = static_cast<int32_t>(pos24);
+
+        if (!axis.EncoderPreloadInitialized)
+        {
+            axis.EncoderPreload = axis.EncoderPos;
+            if (axis.EncoderPreload == static_cast<int32_t>(ENC_MIDRANGE))
+            {
+                axis.EncoderPreload += 1;
+            }
+            axis.EncoderPreloadInitialized = true;
+        }
+
         axis.EncoderQtr1 = (axis.EncoderPos & 0x1) ? 1 : 0;
         axis.EncoderQtr5 = axis.EncoderQtr1 ? 0 : 1;
 
@@ -1090,7 +1109,7 @@ void SimulationPort::DynamicsThreadFunc()
         // let's notify about it
         if (sleep_us <= 0)
         {
-            std::cerr << "[Simulation Port] Dynamics thread is running behind!" << std::endl;
+            std::cerr << "[Simulation Port] Dynamics thread is running behind of target period: elapsed: " << elapsed << " us, Target: " << target_us << " us" << std::endl;
         }
 
         std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
